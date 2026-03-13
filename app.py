@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import io
 import json
 import time
+import zipfile
 from typing import Dict, List
 
 import pandas as pd
@@ -223,12 +225,26 @@ def _collect_session_values(apis: List[ApiRecord], include_sensitive: bool) -> D
     for api in apis:
         if api.endpoint.base_url:
             values["base_url"] = api.endpoint.base_url
+
+        if api.body.content_type:
+            values["content_type"] = api.body.content_type
+
         for h in api.headers:
             if not h.name or h.value is None:
                 continue
             var_name = h.variable_name or h.name.lower().replace("-", "_")
             if include_sensitive or not h.sensitive:
-                values[var_name] = h.value
+                values[var_name] = str(h.value)
+
+        for q in api.query_params:
+            if q.name and q.value is not None:
+                var_name = q.variable_name or q.name.lower()
+                values[var_name] = str(q.value)
+
+        for pp in api.path_params:
+            if pp.name and pp.value is not None:
+                values[pp.name] = str(pp.value)
+
     return values
 
 
@@ -301,20 +317,28 @@ def _render_export_tab(lang: str, apis: List[ApiRecord], selected_api: ApiRecord
     include_values = st.checkbox(t(lang, "include_current_values"), value=True)
     selected_ids = st.multiselect(t(lang, "select_api_export"), options=[a.id for a in apis], default=[selected_api.id])
 
-    if st.button(t(lang, "prepare_export"), type="primary"):
-        selected_apis = [a for a in apis if a.id in selected_ids]
-        if not selected_apis:
-            st.error(t(lang, "no_api_selected"))
-            return
+    effective_include_values = True if sensitive_mode else include_values
+    selected_apis = [a for a in apis if a.id in selected_ids]
+    if selected_apis:
         session_values = _collect_session_values(selected_apis, include_sensitive=sensitive_mode)
         collection_json, environment_json = build_postman_collection_and_env(
             selected_apis,
-            include_current_values=include_values,
+            include_current_values=effective_include_values,
             include_sensitive_values=sensitive_mode,
             session_values=session_values,
         )
+
+        zip_buffer = io.BytesIO()
+        with zipfile.ZipFile(zip_buffer, mode="w", compression=zipfile.ZIP_DEFLATED) as zip_file:
+            zip_file.writestr("collection.postman_collection.json", collection_json)
+            zip_file.writestr("environment.postman_environment.json", environment_json)
+        zip_buffer.seek(0)
+
         st.download_button(t(lang, "download_collection"), collection_json, "collection.postman_collection.json", "application/json", use_container_width=True)
         st.download_button(t(lang, "download_environment"), environment_json, "environment.postman_environment.json", "application/json", use_container_width=True)
+        st.download_button(t(lang, "download_all"), zip_buffer.getvalue(), "postman_export_bundle.zip", "application/zip", use_container_width=True)
+    elif st.button(t(lang, "prepare_export"), type="primary"):
+        st.error(t(lang, "no_api_selected"))
 
 
 apply_custom_theme_css()

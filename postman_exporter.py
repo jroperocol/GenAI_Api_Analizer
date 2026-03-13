@@ -3,12 +3,15 @@
 from __future__ import annotations
 
 import json
+import re
 import uuid
 from typing import Dict, List, Optional, Set, Tuple
 from urllib.parse import urlparse
 
 from models import ApiRecord
 from security import is_sensitive_key
+
+PATH_PARAM_PATTERNS = [re.compile(r"\{([^}]+)\}"), re.compile(r":([A-Za-z0-9_\-]+)")]
 
 
 def _postman_url(raw_url: str) -> Dict:
@@ -20,7 +23,10 @@ def _postman_url(raw_url: str) -> Dict:
         "protocol": parsed.scheme or "https",
         "host": host_parts,
         "path": path_parts,
-        "query": [{"key": k, "value": v} for k, v in [q.split("=", 1) if "=" in q else (q, "") for q in parsed.query.split("&") if q]],
+        "query": [
+            {"key": k, "value": v}
+            for k, v in [q.split("=", 1) if "=" in q else (q, "") for q in parsed.query.split("&") if q]
+        ],
     }
 
 
@@ -31,6 +37,20 @@ def _body_mode(content_type: str | None) -> str:
     if "multipart/form-data" in ct:
         return "formdata"
     return "raw"
+
+
+def _header_var_name(name: str, existing: Optional[str]) -> str:
+    if existing:
+        return existing
+    return name.lower().replace("-", "_").strip()
+
+
+def _apply_path_param_variables(path_or_url: str, path_values: Dict[str, str]) -> str:
+    rendered = path_or_url
+    for key in path_values:
+        rendered = rendered.replace(f"{{{key}}}", f"{{{{{key}}}}}")
+        rendered = rendered.replace(f":{key}", f"{{{{{key}}}}}")
+    return rendered
 
 
 def build_postman_collection_and_env(
@@ -45,14 +65,26 @@ def build_postman_collection_and_env(
 
     for api in apis:
         base_url = api.endpoint.base_url or "{{base_url}}"
-        final_path = api.endpoint.path or api.endpoint.raw
-        raw_url = f"{base_url.rstrip('/')}/{final_path.lstrip('/')}" if final_path else base_url
+        raw_target = api.endpoint.path or api.endpoint.raw
+
+        # Path params are always exported as variables when names are known.
+        path_param_values: Dict[str, str] = {}
+        for p in api.path_params:
+            if not p.name:
+                continue
+            used_env_keys.add(p.name)
+            path_param_values[p.name] = p.value or ""
+            if p.value is not None:
+                session_values[p.name] = p.value
+
+        variable_path = _apply_path_param_variables(raw_target, path_param_values)
+        raw_url = f"{base_url.rstrip('/')}/{variable_path.lstrip('/')}" if variable_path else base_url
 
         header_entries = []
         for header in api.headers:
             if not header.name:
                 continue
-            var_name = (header.variable_name or header.name.lower().replace("-", "_")).strip()
+            var_name = _header_var_name(header.name, header.variable_name)
             if not var_name:
                 continue
             used_env_keys.add(var_name)
@@ -64,6 +96,12 @@ def build_postman_collection_and_env(
                 session_values.setdefault(var_name, "<REPLACE_ME>")
 
             header_entries.append({"key": header.name, "value": f"{{{{{var_name}}}}}", "type": "text"})
+
+        # Ensure content-type can be exported even if not listed as a header row.
+        if api.body.content_type and not any(h.get("key", "").lower() == "content-type" for h in header_entries):
+            used_env_keys.add("content_type")
+            session_values.setdefault("content_type", api.body.content_type)
+            header_entries.append({"key": "Content-Type", "value": "{{content_type}}", "type": "text"})
 
         query_entries = []
         for query in api.query_params:
@@ -120,8 +158,11 @@ def build_postman_collection_and_env(
     for key in sorted(used_env_keys):
         sensitive = is_sensitive_key(key)
         value = "<REPLACE_ME>"
-        if include_current_values and key in session_values:
-            value = session_values[key] if (include_sensitive_values or not sensitive) else "<REPLACE_ME>"
+        if key in session_values:
+            if include_current_values and (include_sensitive_values or not sensitive):
+                value = session_values[key]
+            elif include_current_values and sensitive and not include_sensitive_values:
+                value = "<REPLACE_ME>"
         env_values.append({"key": key, "value": value, "enabled": True})
 
     environment = {
