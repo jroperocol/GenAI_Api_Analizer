@@ -214,6 +214,30 @@ def _build_effective_headers(api: ApiRecord, auth_payload: Dict[str, str]) -> Di
             effective[header_name] = f"{prefix} {token}".strip() if prefix else token
 
     return effective
+
+
+def _headers_mirror_dataframe(api: ApiRecord, effective_headers: Dict[str, str]) -> pd.DataFrame:
+    rows = []
+    by_name = {(h.name or "").lower(): h for h in api.headers if h.name}
+    for name, value in effective_headers.items():
+        item = by_name.get(name.lower())
+        source = "ui_override"
+        if item and item.description:
+            source = "extracted_header"
+        if name.lower() == "content-type" and api.body.content_type:
+            source = "inferred_content_type"
+        rows.append(
+            {
+                "name": name,
+                "value": value,
+                "required": bool(item.required) if item else False,
+                "sensitive": bool(item.sensitive) if item else any(tok in name.lower() for tok in SENSITIVE_HINTS),
+                "variable_name": (item.variable_name if item else name.lower().replace("-", "_")) or "",
+                "description": item.description if item else "",
+                "source_mapping": source,
+            }
+        )
+    return pd.DataFrame(rows)
 def _progress_update(progress_bar, status_box, start: int, target: int, msg: str) -> int:
     for p in range(start, target + 1):
         progress_bar.progress(p)
@@ -456,6 +480,7 @@ def _render_request_tab(lang: str, api: ApiRecord) -> None:
     api.description = st.text_area(t(lang, "description"), value=api.description, key=f"desc_{api.id}", height=70)
 
     tab_auth, tab_params, tab_headers, tab_body = st.tabs([t(lang, "auth_tab"), t(lang, "params_tab"), t(lang, "headers_tab"), t(lang, "body_tab")])
+    apply_auth = False
 
     with tab_auth:
         auth_values = [a.value for a in AuthType]
@@ -466,21 +491,23 @@ def _render_request_tab(lang: str, api: ApiRecord) -> None:
             default_user, default_pass = _extract_basic_from_headers(api)
             c_user, c_pass = st.columns(2)
             basic_user = c_user.text_input(t(lang, "auth_username"), value=default_user, key=f"basic_user_{api.id}")
-            basic_pass = c_pass.text_input(t(lang, "auth_password"), value=default_pass, type="password", key=f"basic_pass_{api.id}")
+            basic_pass = c_pass.text_input(t(lang, "auth_password"), value=default_pass, type="default" if st.session_state.allow_sensitive_extraction else "password", key=f"basic_pass_{api.id}")
             auth_payload = {"username": basic_user, "password": basic_pass}
-            _sync_auth_to_headers(api, api.auth.type, auth_payload)
+            
 
         elif api.auth.type == AuthType.TOKEN:
             default_header, default_prefix, default_token = _extract_token_from_headers(api)
             c_h, c_p, c_t = st.columns([1.3, 1, 2])
             header_name = c_h.text_input(t(lang, "auth_header_name"), value=default_header, key=f"token_header_{api.id}")
             token_prefix = c_p.text_input(t(lang, "auth_token_prefix"), value=default_prefix or "Bearer", key=f"token_prefix_{api.id}")
-            token_value = c_t.text_input(t(lang, "auth_token_value"), value=default_token, type="password", key=f"token_value_{api.id}")
+            token_value = c_t.text_input(t(lang, "auth_token_value"), value=default_token, type="default" if st.session_state.allow_sensitive_extraction else "password", key=f"token_value_{api.id}")
             auth_payload = {"header_name": header_name, "prefix": token_prefix, "token": token_value}
-            _sync_auth_to_headers(api, api.auth.type, auth_payload)
+            
 
         elif api.auth.type == AuthType.UNKNOWN:
             st.warning(t(lang, "auth_unknown_warning"))
+
+        apply_auth = st.button(t(lang, "apply_auth_to_headers"), key=f"apply_auth_{api.id}")
 
     with tab_params:
         st.caption(t(lang, "path_params"))
@@ -490,7 +517,8 @@ def _render_request_tab(lang: str, api: ApiRecord) -> None:
 
     with tab_headers:
         st.caption(t(lang, "headers_source_of_truth"))
-        api.headers = _param_editor(api.id, "headers", api.headers)
+        # Read-only mirror table populated from effective request headers.
+        pass
 
     with tab_body:
         api.body.required = st.checkbox(t(lang, "body_required"), value=api.body.required, key=f"body_req_{api.id}")
@@ -511,8 +539,12 @@ def _render_request_tab(lang: str, api: ApiRecord) -> None:
     else:
         api.body.example = None
 
-    effective_headers = _build_effective_headers(api, auth_payload)
+    effective_headers = _build_effective_headers(api, auth_payload if apply_auth else {})
     _sync_headers_table_from_effective_headers(api, effective_headers)
+
+    with tab_headers:
+        mirror_df = _headers_mirror_dataframe(api, effective_headers)
+        st.dataframe(mirror_df, use_container_width=True, hide_index=True)
 
     validate_api(api)
 
