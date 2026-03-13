@@ -165,6 +165,55 @@ def _sync_auth_to_headers(api: ApiRecord, auth_type: AuthType, fields: Dict[str,
             value = f"{prefix} {token_value}".strip() if prefix else token_value
             _upsert_header(api, header_name, value, sensitive=True)
 
+
+
+def _sync_headers_table_from_effective_headers(api: ApiRecord, effective_headers: Dict[str, str]) -> None:
+    """Ensure header table values reflect known effective header values."""
+    normalized = {k.strip(): str(v) for k, v in effective_headers.items() if k and str(v).strip() != ""}
+
+    existing_by_name = {(h.name or "").lower(): h for h in api.headers if h.name}
+    for name, value in normalized.items():
+        key = name.lower()
+        if key in existing_by_name:
+            existing_by_name[key].value = value
+        else:
+            api.headers.append(
+                ParamField(
+                    name=name,
+                    value=value,
+                    required=False,
+                    sensitive=any(tok in key for tok in SENSITIVE_HINTS),
+                    variable_name=name.lower().replace("-", "_"),
+                )
+            )
+
+
+def _build_effective_headers(api: ApiRecord, auth_payload: Dict[str, str]) -> Dict[str, str]:
+    """Build effective headers from current request configuration."""
+    effective: Dict[str, str] = {}
+
+    for h in api.headers:
+        if h.name and h.value is not None and str(h.value).strip() != "":
+            effective[h.name] = str(h.value)
+
+    if api.body.content_type:
+        effective["Content-Type"] = api.body.content_type
+
+    if api.auth.type == AuthType.BASIC:
+        user = auth_payload.get("username", "").strip()
+        pwd = auth_payload.get("password", "")
+        if user or pwd:
+            token = base64.b64encode(f"{user}:{pwd}".encode("utf-8")).decode("utf-8")
+            effective["Authorization"] = f"Basic {token}"
+
+    elif api.auth.type == AuthType.TOKEN:
+        header_name = auth_payload.get("header_name", "Authorization").strip() or "Authorization"
+        prefix = auth_payload.get("prefix", "").strip()
+        token = auth_payload.get("token", "").strip()
+        if token:
+            effective[header_name] = f"{prefix} {token}".strip() if prefix else token
+
+    return effective
 def _progress_update(progress_bar, status_box, start: int, target: int, msg: str) -> int:
     for p in range(start, target + 1):
         progress_bar.progress(p)
@@ -392,6 +441,7 @@ def _collect_session_values(apis: List[ApiRecord], include_sensitive: bool) -> D
 
 def _render_request_tab(lang: str, api: ApiRecord) -> None:
     methods = [m.value for m in HttpMethod]
+    auth_payload: Dict[str, str] = {}
     c1, c2, c3, c4 = st.columns([1, 3.2, 1, 1.3])
 
     method = c1.selectbox(t(lang, "http_method"), methods, index=methods.index(api.method.value if api.method else "GET"), key=f"method_{api.id}")
@@ -417,7 +467,8 @@ def _render_request_tab(lang: str, api: ApiRecord) -> None:
             c_user, c_pass = st.columns(2)
             basic_user = c_user.text_input(t(lang, "auth_username"), value=default_user, key=f"basic_user_{api.id}")
             basic_pass = c_pass.text_input(t(lang, "auth_password"), value=default_pass, type="password", key=f"basic_pass_{api.id}")
-            _sync_auth_to_headers(api, api.auth.type, {"username": basic_user, "password": basic_pass})
+            auth_payload = {"username": basic_user, "password": basic_pass}
+            _sync_auth_to_headers(api, api.auth.type, auth_payload)
 
         elif api.auth.type == AuthType.TOKEN:
             default_header, default_prefix, default_token = _extract_token_from_headers(api)
@@ -425,7 +476,8 @@ def _render_request_tab(lang: str, api: ApiRecord) -> None:
             header_name = c_h.text_input(t(lang, "auth_header_name"), value=default_header, key=f"token_header_{api.id}")
             token_prefix = c_p.text_input(t(lang, "auth_token_prefix"), value=default_prefix or "Bearer", key=f"token_prefix_{api.id}")
             token_value = c_t.text_input(t(lang, "auth_token_value"), value=default_token, type="password", key=f"token_value_{api.id}")
-            _sync_auth_to_headers(api, api.auth.type, {"header_name": header_name, "prefix": token_prefix, "token": token_value})
+            auth_payload = {"header_name": header_name, "prefix": token_prefix, "token": token_value}
+            _sync_auth_to_headers(api, api.auth.type, auth_payload)
 
         elif api.auth.type == AuthType.UNKNOWN:
             st.warning(t(lang, "auth_unknown_warning"))
@@ -458,6 +510,9 @@ def _render_request_tab(lang: str, api: ApiRecord) -> None:
             api.body.example = body_text
     else:
         api.body.example = None
+
+    effective_headers = _build_effective_headers(api, auth_payload)
+    _sync_headers_table_from_effective_headers(api, effective_headers)
 
     validate_api(api)
 
