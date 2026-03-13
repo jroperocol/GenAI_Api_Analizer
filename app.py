@@ -16,7 +16,7 @@ from file_ingestion import SUPPORTED_TYPES, extract_text_from_uploads
 from i18n import t
 from models import AnalysisPayload, ApiRecord, ApiStatus, AuthType, HttpMethod, ParamField
 from postman_exporter import build_postman_collection_and_env
-from security import contains_likely_credentials, mask_sensitive_headers, sanitize_analysis_payload
+from security import contains_likely_credentials, mask_secret, mask_sensitive_headers, sanitize_analysis_payload
 from test_runner import RequestExecutionError, execute_test_request
 from validator import validate_analysis, validate_api
 
@@ -24,6 +24,7 @@ st.set_page_config(page_title="GoAI API Documentation Interpreter", layout="wide
 
 LANG_NAMES = {"en": "English", "es": "Español", "pt": "Português"}
 METHOD_COLORS = {"GET": "#34d399", "POST": "#60a5fa", "PUT": "#f59e0b", "PATCH": "#a78bfa", "DELETE": "#f87171"}
+SENSITIVE_HINTS = ("token", "key", "secret", "pass", "cookie", "auth", "credential")
 
 
 def apply_custom_theme_css() -> None:
@@ -46,6 +47,7 @@ def apply_custom_theme_css() -> None:
 def _init_state() -> None:
     defaults = {
         "analysis": AnalysisPayload(),
+        "apis": [],
         "selected_api_id": None,
         "active_env": "raw",
         "lang": "en",
@@ -59,18 +61,19 @@ def _init_state() -> None:
             st.session_state[key] = value
 
 
+
 def _api_label(api: ApiRecord) -> str:
     method = api.method.value if api.method else "-"
     return f"{method} | {api.name or api.id}"
+
 
 
 def _get_selected_api(apis: List[ApiRecord]) -> ApiRecord | None:
     if not apis:
         return None
     selected = next((a for a in apis if a.id == st.session_state.selected_api_id), None)
-    if selected:
-        return selected
-    return apis[0]
+    return selected or apis[0]
+
 
 
 def _compose_url(api: ApiRecord, env: str = "raw") -> str:
@@ -85,10 +88,12 @@ def _compose_url(api: ApiRecord, env: str = "raw") -> str:
     return api.endpoint.base_url or api.endpoint.path or ""
 
 
+
 def _param_editor(api_id: str, key: str, data: List[ParamField]) -> List[ParamField]:
     frame = pd.DataFrame([item.model_dump() for item in data]) if data else pd.DataFrame(columns=["name", "value", "required", "sensitive", "variable_name", "description"])
     updated = st.data_editor(frame, num_rows="dynamic", use_container_width=True, key=f"{api_id}_{key}")
     return [ParamField(**row) for row in updated.to_dict(orient="records") if row.get("name")]
+
 
 
 def _progress_update(progress_bar, status_box, start: int, target: int, msg: str) -> int:
@@ -97,6 +102,7 @@ def _progress_update(progress_bar, status_box, start: int, target: int, msg: str
         status_box.info(msg)
         time.sleep(0.006)
     return target
+
 
 
 def _analysis_error_message(lang: str, err: str) -> str:
@@ -108,10 +114,81 @@ def _analysis_error_message(lang: str, err: str) -> str:
     return t(lang, "analysis_failed_generic")
 
 
+
+def _is_sensitive_param(field: ParamField) -> bool:
+    name = f"{field.name} {field.variable_name or ''} {field.description or ''}".lower()
+    return field.sensitive or any(token in name for token in SENSITIVE_HINTS)
+
+
+
+def _summarize_tokens(api: ApiRecord, allow_sensitive: bool) -> str:
+    values = []
+    for h in api.headers:
+        if h.value is None or not h.name:
+            continue
+        if _is_sensitive_param(h):
+            values.append(f"{h.name}={h.value if allow_sensitive else mask_secret(str(h.value))}")
+    return "; ".join(values) if values else "-"
+
+
+
+def _detect_body_type(api: ApiRecord) -> str:
+    ct = (api.body.content_type or "").lower()
+    if not api.body.required and api.body.example in (None, "", {}, []):
+        return "none"
+    if "json" in ct:
+        return "json"
+    if "x-www-form-urlencoded" in ct:
+        return "form-urlencoded"
+    if "multipart/form-data" in ct:
+        return "multipart"
+    if ct:
+        return "raw"
+    return "none"
+
+
+
+def _missing_critical_fields(api: ApiRecord) -> str:
+    missing: List[str] = []
+    full_url = _compose_url(api, st.session_state.active_env)
+
+    if not api.method:
+        missing.append("method")
+    if not full_url:
+        missing.append("url")
+    if api.auth.type is None:
+        missing.append("auth")
+
+    if api.body.required and (api.body.example in (None, "", {}, []) and not api.body.schema):
+        missing.append("body")
+
+    req_headers_missing = any((h.required and (h.value is None or str(h.value).strip() == "")) for h in api.headers)
+    if req_headers_missing:
+        missing.append("required_headers")
+
+    return ", ".join(dict.fromkeys(missing)) if missing else "READY"
+
+
+
+def _build_summary_df(api: ApiRecord, allow_sensitive: bool) -> pd.DataFrame:
+    headers = ", ".join([h.name for h in api.headers if h.name]) or "-"
+    row = {
+        "API Name": api.name or api.id,
+        "HTTP Method": api.method.value if api.method else "",
+        "Full Endpoint URL": _compose_url(api, st.session_state.active_env),
+        "Auth Type": api.auth.type.value,
+        "Headers": headers,
+        "Body Type": _detect_body_type(api),
+        "Tokens / Keys": _summarize_tokens(api, allow_sensitive),
+        "Missing Critical Fields": _missing_critical_fields(api),
+    }
+    return pd.DataFrame([row])
+
+
+
 def _run_analysis(lang: str, api_key: str, uploaded_files, raw_text: str, allow_sensitive: bool) -> None:
     st.session_state.analysis_error = ""
-    prog_box = st.container()
-    with prog_box:
+    with st.container():
         st.markdown(f'<div class="goai-card"><div class="section-label">{t(lang, "analysis_progress_title")}</div>', unsafe_allow_html=True)
         pbar = st.progress(0)
         status = st.empty()
@@ -126,7 +203,7 @@ def _run_analysis(lang: str, api_key: str, uploaded_files, raw_text: str, allow_
             raise ExtractionError(t(lang, "analyze_missing_input"))
 
         p = _progress_update(pbar, status, p, 20, t(lang, "analysis_stage_20"))
-        file_text, source_files, ingest_warnings = extract_text_from_uploads(uploaded_files or [])
+        file_text, source_files, warnings = extract_text_from_uploads(uploaded_files or [])
         p = _progress_update(pbar, status, p, 35, t(lang, "analysis_stage_35"))
 
         combined_text = "\n\n".join(part for part in [file_text, raw_text] if part.strip())
@@ -135,7 +212,7 @@ def _run_analysis(lang: str, api_key: str, uploaded_files, raw_text: str, allow_
 
         if contains_likely_credentials(combined_text):
             st.warning(t(lang, "sensitive_detected"))
-        for warning in ingest_warnings:
+        for warning in warnings:
             st.warning(warning)
 
         p = _progress_update(pbar, status, p, 50, t(lang, "analysis_stage_50"))
@@ -151,7 +228,8 @@ def _run_analysis(lang: str, api_key: str, uploaded_files, raw_text: str, allow_
         _progress_update(pbar, status, p, 100, t(lang, "analysis_stage_100"))
 
         st.session_state.analysis = validated
-        selected = _get_selected_api(validated.document_analysis.apis)
+        st.session_state.apis = validated.document_analysis.apis
+        selected = _get_selected_api(st.session_state.apis)
         st.session_state.selected_api_id = selected.id if selected else None
         st.success(t(lang, "detected_apis").format(count=validated.document_analysis.api_count))
     except Exception as exc:  # noqa: BLE001
@@ -162,42 +240,38 @@ def _run_analysis(lang: str, api_key: str, uploaded_files, raw_text: str, allow_
             st.code(str(exc))
 
 
-def _build_send_payload(api: ApiRecord, body_text: str) -> Dict[str, str]:
-    headers: Dict[str, str] = {}
-    for h in api.headers:
-        if h.name and (h.value is not None) and str(h.value).strip() != "":
-            headers[h.name] = str(h.value)
 
+def _build_send_payload(api: ApiRecord, body_text: str) -> Dict[str, Dict[str, str] | str]:
+    headers = {h.name: str(h.value) for h in api.headers if h.name and h.value is not None and str(h.value).strip() != ""}
     query: Dict[str, str] = {}
     for q in api.query_params:
         if q.name and str(q.value or "").strip() != "":
             query[q.name] = str(q.value)
         elif q.name and q.required:
             query[q.name] = ""
-
     return {"headers": headers, "query": query, "body": body_text}
 
 
-def _render_inline_response(lang: str, response: Dict | None) -> None:
-    result_container = st.container()
-    with result_container:
-        if not response:
-            st.info(t(lang, "no_response"))
-            return
-        st.markdown(
-            f'<div class="toolbar"><span class="chip">{t(lang, "status_code")}: <b>{response.get("status_code", "-")}</b></span>'
-            f'<span class="chip">{t(lang, "response_time")}: <b>{response.get("response_time_ms", "-")} ms</b></span>'
-            f'<span class="chip">{t(lang, "response_size")}: <b>{response.get("response_size_bytes", "-")} B</b></span></div>',
-            unsafe_allow_html=True,
-        )
-        st.caption(t(lang, "response_headers"))
-        st.json(mask_sensitive_headers(response.get("headers", {})))
-        st.caption(t(lang, "response_body"))
-        body = response.get("body", "")
-        try:
-            st.json(json.loads(body))
-        except Exception:  # noqa: BLE001
-            st.code(body)
+
+def _render_response_block(lang: str, response: Dict | None) -> None:
+    if not response:
+        st.info(t(lang, "no_response"))
+        return
+    st.markdown(
+        f'<div class="toolbar"><span class="chip">{t(lang, "status_code")}: <b>{response.get("status_code", "-")}</b></span>'
+        f'<span class="chip">{t(lang, "response_time")}: <b>{response.get("response_time_ms", "-")} ms</b></span>'
+        f'<span class="chip">{t(lang, "response_size")}: <b>{response.get("response_size_bytes", "-")} B</b></span></div>',
+        unsafe_allow_html=True,
+    )
+    st.caption(t(lang, "response_headers"))
+    st.json(mask_sensitive_headers(response.get("headers", {})))
+    st.caption(t(lang, "response_body"))
+    body = response.get("body", "")
+    try:
+        st.json(json.loads(body))
+    except Exception:  # noqa: BLE001
+        st.code(body)
+
 
 
 def _test_api(lang: str, api: ApiRecord, method: str, url: str, body_text: str, timeout: int = 30) -> None:
@@ -220,46 +294,44 @@ def _test_api(lang: str, api: ApiRecord, method: str, url: str, body_text: str, 
         st.error(f"{t(lang, 'request_failed')}: {exc}")
 
 
+
 def _collect_session_values(apis: List[ApiRecord], include_sensitive: bool) -> Dict[str, str]:
     values: Dict[str, str] = {}
     for api in apis:
         if api.endpoint.base_url:
             values["base_url"] = api.endpoint.base_url
-
         if api.body.content_type:
             values["content_type"] = api.body.content_type
 
         for h in api.headers:
             if not h.name or h.value is None:
                 continue
-            var_name = h.variable_name or h.name.lower().replace("-", "_")
-            if include_sensitive or not h.sensitive:
-                values[var_name] = str(h.value)
+            key = h.variable_name or h.name.lower().replace("-", "_")
+            if include_sensitive or not _is_sensitive_param(h):
+                values[key] = str(h.value)
 
         for q in api.query_params:
             if q.name and q.value is not None:
-                var_name = q.variable_name or q.name.lower()
-                values[var_name] = str(q.value)
+                values[q.variable_name or q.name.lower()] = str(q.value)
 
-        for pp in api.path_params:
-            if pp.name and pp.value is not None:
-                values[pp.name] = str(pp.value)
-
+        for p in api.path_params:
+            if p.name and p.value is not None:
+                values[p.name] = str(p.value)
     return values
+
 
 
 def _render_request_tab(lang: str, api: ApiRecord) -> None:
     methods = [m.value for m in HttpMethod]
-
     c1, c2, c3, c4 = st.columns([1, 3.2, 1, 1.3])
+
     method = c1.selectbox(t(lang, "http_method"), methods, index=methods.index(api.method.value if api.method else "GET"), key=f"method_{api.id}")
     api.method = HttpMethod(method)
     env = c3.selectbox(t(lang, "environment"), ["raw", "qa", "prd"], index=["raw", "qa", "prd"].index(st.session_state.active_env), key=f"env_{api.id}")
     st.session_state.active_env = env
     final_url = c2.text_input(t(lang, "final_url"), value=_compose_url(api, env), key=f"url_{api.id}")
     api.endpoint.raw = final_url
-
-    send_now = c4.button(t(lang, "test_api"), type="primary", use_container_width=True, key=f"send_{api.id}")
+    run_now = c4.button(t(lang, "test_api"), use_container_width=True, type="primary", key=f"send_{api.id}")
 
     api.name = st.text_input(t(lang, "api_name"), value=api.name, key=f"name_{api.id}")
     api.description = st.text_area(t(lang, "description"), value=api.description, key=f"desc_{api.id}", height=70)
@@ -284,7 +356,12 @@ def _render_request_tab(lang: str, api: ApiRecord) -> None:
         api.body.required = st.checkbox(t(lang, "body_required"), value=api.body.required, key=f"body_req_{api.id}")
         ct_options = ["", "application/json", "application/x-www-form-urlencoded", "multipart/form-data", "text/plain"]
         api.body.content_type = st.selectbox(t(lang, "content_type"), ct_options, index=ct_options.index(api.body.content_type or ""), key=f"ct_{api.id}") or None
-        body_text = st.text_area(t(lang, "request_body"), value=json.dumps(api.body.example, indent=2) if isinstance(api.body.example, (dict, list)) else (api.body.example or ""), height=190, key=f"body_{api.id}")
+        body_text = st.text_area(
+            t(lang, "request_body"),
+            value=json.dumps(api.body.example, indent=2) if isinstance(api.body.example, (dict, list)) else (api.body.example or ""),
+            height=190,
+            key=f"body_{api.id}",
+        )
 
     if body_text.strip():
         try:
@@ -296,55 +373,57 @@ def _render_request_tab(lang: str, api: ApiRecord) -> None:
 
     validate_api(api)
 
-    if send_now:
+    if run_now:
         _test_api(lang, api, method, final_url, body_text, timeout=30)
 
-    live_result = st.session_state.last_response if st.session_state.last_response_api_id == api.id else None
-    _render_inline_response(lang, live_result)
+    live = st.session_state.last_response if st.session_state.last_response_api_id == api.id else None
+    _render_response_block(lang, live)
+
 
 
 def _render_response_tab(lang: str, api: ApiRecord) -> None:
-    result = st.session_state.last_response if st.session_state.last_response_api_id == api.id else None
-    _render_inline_response(lang, result)
+    resp = st.session_state.last_response if st.session_state.last_response_api_id == api.id else None
+    _render_response_block(lang, resp)
+
 
 
 def _render_export_tab(lang: str, apis: List[ApiRecord], selected_api: ApiRecord) -> None:
     sensitive_mode = st.session_state.allow_sensitive_extraction
-    st.info(f"{t(lang, 'sensitive_export_mode') if sensitive_mode else t(lang, 'safe_export_mode')} — {t(lang, 'credentials_included') if sensitive_mode else t(lang, 'credentials_omitted')}")
+    st.info(
+        f"{t(lang, 'sensitive_export_mode') if sensitive_mode else t(lang, 'safe_export_mode')} — "
+        f"{t(lang, 'credentials_included') if sensitive_mode else t(lang, 'credentials_omitted')}"
+    )
     if sensitive_mode:
         st.warning(t(lang, "sensitive_export_warning"))
 
-    include_values = st.checkbox(t(lang, "include_current_values"), value=True)
     selected_ids = st.multiselect(t(lang, "select_api_export"), options=[a.id for a in apis], default=[selected_api.id])
+    selected_apis = [a for a in st.session_state["apis"] if a.id in selected_ids]
 
-    effective_include_values = True if sensitive_mode else include_values
-    selected_apis = [a for a in apis if a.id in selected_ids]
-    if selected_apis:
-        session_values = _collect_session_values(selected_apis, include_sensitive=sensitive_mode)
-        collection_json, environment_json = build_postman_collection_and_env(
-            selected_apis,
-            include_current_values=effective_include_values,
-            include_sensitive_values=sensitive_mode,
-            session_values=session_values,
-        )
-
-        zip_buffer = io.BytesIO()
-        with zipfile.ZipFile(zip_buffer, mode="w", compression=zipfile.ZIP_DEFLATED) as zip_file:
-            zip_file.writestr("collection.postman_collection.json", collection_json)
-            zip_file.writestr("environment.postman_environment.json", environment_json)
-        zip_buffer.seek(0)
-
-        st.download_button(t(lang, "download_collection"), collection_json, "collection.postman_collection.json", "application/json", use_container_width=True)
-        st.download_button(t(lang, "download_environment"), environment_json, "environment.postman_environment.json", "application/json", use_container_width=True)
-        st.download_button(t(lang, "download_all"), zip_buffer.getvalue(), "postman_export_bundle.zip", "application/zip", use_container_width=True)
-    elif st.button(t(lang, "prepare_export"), type="primary"):
+    if not selected_apis:
         st.error(t(lang, "no_api_selected"))
+        return
+
+    session_values = _collect_session_values(selected_apis, include_sensitive=sensitive_mode)
+    collection_json, environment_json = build_postman_collection_and_env(
+        selected_apis,
+        include_current_values=True,
+        include_sensitive_values=sensitive_mode,
+        session_values=session_values,
+    )
+
+    zip_buffer = io.BytesIO()
+    with zipfile.ZipFile(zip_buffer, mode="w", compression=zipfile.ZIP_DEFLATED) as zf:
+        zf.writestr("collection.postman_collection.json", collection_json)
+        zf.writestr("environment.postman_environment.json", environment_json)
+    zip_buffer.seek(0)
+
+    st.download_button(t(lang, "download_collection"), collection_json, "collection.postman_collection.json", "application/json", use_container_width=True)
+    st.download_button(t(lang, "download_environment"), environment_json, "environment.postman_environment.json", "application/json", use_container_width=True)
+    st.download_button(t(lang, "download_all"), zip_buffer.getvalue(), "postman_export_bundle.zip", "application/zip", use_container_width=True)
 
 
 apply_custom_theme_css()
 _init_state()
-analysis: AnalysisPayload = st.session_state.analysis
-apis: List[ApiRecord] = analysis.document_analysis.apis
 
 left_col, right_col = st.columns([0.32, 0.68], gap="large")
 
@@ -352,12 +431,11 @@ with left_col:
     lang = st.selectbox(t("en", "language"), ["en", "es", "pt"], format_func=lambda c: LANG_NAMES[c])
     st.session_state.lang = lang
 
-    with st.container(border=False):
-        st.markdown('<div class="goai-card">', unsafe_allow_html=True)
-        st.markdown(f"### {t(lang, 'title')}")
-        st.caption(t(lang, "subtitle"))
-        st.caption(t(lang, "powered"))
-        st.markdown("</div>", unsafe_allow_html=True)
+    st.markdown('<div class="goai-card">', unsafe_allow_html=True)
+    st.markdown(f"### {t(lang, 'title')}")
+    st.caption(t(lang, "subtitle"))
+    st.caption(t(lang, "powered"))
+    st.markdown("</div>", unsafe_allow_html=True)
 
     st.markdown('<div class="goai-card">', unsafe_allow_html=True)
     st.markdown(f'<div class="section-label">{t(lang, "session_panel")}</div>', unsafe_allow_html=True)
@@ -377,23 +455,24 @@ with left_col:
     raw_text = st.text_area(t(lang, "paste_text"), height=120)
     if st.button(t(lang, "analyze"), type="primary", use_container_width=True):
         _run_analysis(lang, api_key, uploaded_files, raw_text, st.session_state.allow_sensitive_extraction)
-        apis = st.session_state.analysis.document_analysis.apis
     st.markdown("</div>", unsafe_allow_html=True)
 
     st.markdown('<div class="goai-card">', unsafe_allow_html=True)
-    st.write(f"{t(lang, 'detected_apis_nav')}: **{len(apis)}**")
-    if apis:
-        sel = _get_selected_api(apis)
-        st.caption(f"{t(lang, 'selected_api')}: {sel.name or sel.id}")
+    apis_state: List[ApiRecord] = st.session_state.get("apis", [])
+    st.write(f"{t(lang, 'detected_apis_nav')}: **{len(apis_state)}**")
+    if apis_state:
+        selected = _get_selected_api(apis_state)
+        st.caption(f"{t(lang, 'selected_api')}: {selected.name or selected.id}")
     st.markdown("</div>", unsafe_allow_html=True)
 
 with right_col:
+    apis: List[ApiRecord] = st.session_state.get("apis", [])
     if not apis:
         st.info(t(lang, "no_apis_workspace"))
     else:
         selected = _get_selected_api(apis)
         labels = {_api_label(api): api.id for api in apis}
-        current_label = next((label for label, aid in labels.items() if aid == selected.id), list(labels)[0])
+        current_label = next((lbl for lbl, aid in labels.items() if aid == selected.id), list(labels)[0])
         chosen = st.selectbox(t(lang, "api_selector"), list(labels.keys()), index=list(labels).index(current_label))
         st.session_state.selected_api_id = labels[chosen]
         selected = _get_selected_api(apis)
@@ -406,6 +485,9 @@ with right_col:
             f'<div style="margin-top:.35rem;font-size:1rem;font-weight:700;">{selected.name or selected.id}</div></div>',
             unsafe_allow_html=True,
         )
+
+        st.caption(t(lang, "api_summary_label"))
+        st.dataframe(_build_summary_df(selected, st.session_state.allow_sensitive_extraction), use_container_width=True, hide_index=True)
 
         request_tab, response_tab, export_tab = st.tabs([t(lang, "request_tab"), t(lang, "response_tab"), t(lang, "export_tab")])
         with request_tab:
