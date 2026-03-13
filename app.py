@@ -3,7 +3,8 @@
 from __future__ import annotations
 
 import json
-from typing import Dict, List, Tuple
+import time
+from typing import Dict, List
 
 import pandas as pd
 import streamlit as st
@@ -39,9 +40,7 @@ def apply_custom_theme_css() -> None:
             color: #e2e8f0;
         }
         .main .block-container {padding-top: 1rem; max-width: 1500px;}
-        [data-testid="stVerticalBlock"] > [style*="flex-direction: column;"] > [data-testid="stVerticalBlock"] {
-            gap: .6rem;
-        }
+        [data-testid="stVerticalBlock"] > [style*="flex-direction: column;"] > [data-testid="stVerticalBlock"] { gap: .6rem; }
         .goai-card {
             background: rgba(15, 23, 42, 0.68);
             border: 1px solid rgba(148, 163, 184, 0.22);
@@ -69,10 +68,6 @@ def apply_custom_theme_css() -> None:
             background: rgba(15,23,42,.72); border: 1px solid rgba(148,163,184,.2);
             border-radius: 14px; padding: .65rem .8rem; margin-bottom: .6rem;
         }
-        .code-panel {
-            background: #020617; border: 1px solid rgba(71,85,105,.6);
-            border-radius: 12px; padding: .65rem;
-        }
         .chip {
             display:inline-block; padding:.2rem .55rem; border-radius:999px; font-size:.7rem;
             border:1px solid rgba(148,163,184,.4); margin-right:.35rem; margin-bottom:.35rem;
@@ -98,6 +93,12 @@ def _init_state() -> None:
         st.session_state.test_result_by_api = {}
     if "active_env" not in st.session_state:
         st.session_state.active_env = "raw"
+    if "analysis_running" not in st.session_state:
+        st.session_state.analysis_running = False
+    if "analysis_error" not in st.session_state:
+        st.session_state.analysis_error = ""
+    if "analysis_error_details" not in st.session_state:
+        st.session_state.analysis_error_details = ""
 
 
 def _compose_url(api: ApiRecord, env: str = "raw") -> str:
@@ -204,32 +205,95 @@ def _render_api_selector(lang: str, apis: List[ApiRecord]) -> None:
     st.markdown('</div>', unsafe_allow_html=True)
 
 
-def _analyze_docs(lang: str, api_key: str, uploaded_files, raw_text: str) -> None:
-    file_text, source_files, ingest_warnings = extract_text_from_uploads(uploaded_files or [])
-    combined_text = "\n\n".join(part for part in [file_text, raw_text] if part.strip())
+def _progress_update(progress_bar, status_box, percent: int, message: str, smooth_from: int | None = None) -> None:
+    start = smooth_from if smooth_from is not None else percent
+    step = 1 if percent >= start else -1
+    for p in range(start, percent + step, step):
+        progress_bar.progress(p)
+        status_box.info(message)
+        time.sleep(0.01)
 
-    if not combined_text.strip():
-        st.error(t(lang, "analyze_missing_input"))
-        return
-    if not api_key.strip():
-        st.error(t(lang, "analyze_missing_key"))
-        return
 
-    if contains_likely_credentials(combined_text):
-        st.warning(t(lang, "sensitive_detected"))
+def _sanitize_analysis_error(error_text: str) -> str:
+    lower = error_text.lower()
+    if "invalid value" in lower or "input_text" in lower:
+        return t(st.session_state.get("lang", "en"), "analysis_failed_payload")
+    if "api key" in lower or "unauthorized" in lower:
+        return t(st.session_state.get("lang", "en"), "analysis_failed_key")
+    return t(st.session_state.get("lang", "en"), "analysis_failed_generic")
 
-    for warning_text in ingest_warnings:
-        st.warning(warning_text)
+
+def _run_analysis_with_progress(lang: str, api_key: str, uploaded_files, raw_text: str) -> None:
+    progress_wrap = st.container()
+    with progress_wrap:
+        st.markdown('<div class="goai-card">', unsafe_allow_html=True)
+        st.markdown(f'<div class="section-label">{t(lang, "analysis_progress_title")}</div>', unsafe_allow_html=True)
+        progress_bar = st.progress(0)
+        status_box = st.empty()
+        st.markdown('</div>', unsafe_allow_html=True)
+
+    st.session_state.analysis_running = True
+    st.session_state.analysis_error = ""
+    st.session_state.analysis_error_details = ""
+    current_progress = 0
 
     try:
+        _progress_update(progress_bar, status_box, 0, t(lang, "analysis_stage_0"), current_progress)
+        current_progress = 0
+        _progress_update(progress_bar, status_box, 10, t(lang, "analysis_stage_10"), current_progress)
+        current_progress = 10
+
+        if not api_key.strip():
+            raise ExtractionError(t(lang, "analyze_missing_key"))
+        if not raw_text.strip() and not uploaded_files:
+            raise ExtractionError(t(lang, "analyze_missing_input"))
+
+        _progress_update(progress_bar, status_box, 20, t(lang, "analysis_stage_20"), current_progress)
+        current_progress = 20
+        file_text, source_files, ingest_warnings = extract_text_from_uploads(uploaded_files or [])
+
+        _progress_update(progress_bar, status_box, 35, t(lang, "analysis_stage_35"), current_progress)
+        current_progress = 35
+        combined_text = "\n\n".join(part for part in [file_text, raw_text] if part.strip())
+
+        if not combined_text.strip():
+            raise ExtractionError(t(lang, "analyze_missing_input"))
+
+        if contains_likely_credentials(combined_text):
+            st.warning(t(lang, "sensitive_detected"))
+
+        for warning_text in ingest_warnings:
+            st.warning(warning_text)
+
+        _progress_update(progress_bar, status_box, 50, t(lang, "analysis_stage_50"), current_progress)
+        current_progress = 50
+        _progress_update(progress_bar, status_box, 65, t(lang, "analysis_stage_65"), current_progress)
+        current_progress = 65
         analysis = extract_apis_with_openai(api_key=api_key.strip(), doc_text=combined_text)
+
+        _progress_update(progress_bar, status_box, 85, t(lang, "analysis_stage_85"), current_progress)
+        current_progress = 85
         analysis.document_analysis.source_files = source_files
-        st.session_state.analysis = validate_analysis(analysis)
-        first_api = next(iter(st.session_state.analysis.document_analysis.apis), None)
+
+        _progress_update(progress_bar, status_box, 95, t(lang, "analysis_stage_95"), current_progress)
+        current_progress = 95
+        validated = validate_analysis(analysis)
+
+        _progress_update(progress_bar, status_box, 100, t(lang, "analysis_stage_100"), current_progress)
+        st.session_state.analysis = validated
+        first_api = next(iter(validated.document_analysis.apis), None)
         st.session_state.selected_api_id = first_api.id if first_api else None
-        st.success(t(lang, "detected_apis").format(count=st.session_state.analysis.document_analysis.api_count))
-    except ExtractionError as exc:
-        st.error(f"{t(lang, 'analysis_failed')}: {exc}")
+        st.success(t(lang, "detected_apis").format(count=validated.document_analysis.api_count))
+    except Exception as exc:  # noqa: BLE001
+        st.session_state.analysis_error = _sanitize_analysis_error(str(exc))
+        st.session_state.analysis_error_details = str(exc)
+        progress_bar.progress(current_progress)
+        status_box.error(t(lang, "analysis_stage_failed"))
+        st.error(st.session_state.analysis_error)
+        with st.expander(t(lang, "show_technical_details")):
+            st.code(st.session_state.analysis_error_details)
+    finally:
+        st.session_state.analysis_running = False
 
 
 def _render_request_tab(lang: str, selected_api: ApiRecord) -> None:
@@ -285,8 +349,7 @@ def _render_request_tab(lang: str, selected_api: ApiRecord) -> None:
         selected_api.headers = _param_editor(selected_api.id, "headers", selected_api.headers)
 
     with top_tabs[3]:
-        body_required = st.checkbox(t(lang, "body_required"), value=selected_api.body.required)
-        selected_api.body.required = body_required
+        selected_api.body.required = st.checkbox(t(lang, "body_required"), value=selected_api.body.required)
         selected_api.body.content_type = st.selectbox(
             t(lang, "content_type"),
             options=["application/json", "application/x-www-form-urlencoded", "text/plain", ""],
@@ -410,20 +473,8 @@ def _render_export_tab(lang: str, apis: List[ApiRecord], selected_api: ApiRecord
                 session_values=session_values,
             )
 
-            st.download_button(
-                t(lang, "download_collection"),
-                data=collection_json,
-                file_name="collection.postman_collection.json",
-                mime="application/json",
-                use_container_width=True,
-            )
-            st.download_button(
-                t(lang, "download_environment"),
-                data=environment_json,
-                file_name="environment.postman_environment.json",
-                mime="application/json",
-                use_container_width=True,
-            )
+            st.download_button(t(lang, "download_collection"), data=collection_json, file_name="collection.postman_collection.json", mime="application/json", use_container_width=True)
+            st.download_button(t(lang, "download_environment"), data=environment_json, file_name="environment.postman_environment.json", mime="application/json", use_container_width=True)
     st.markdown('</div>', unsafe_allow_html=True)
 
 
@@ -436,6 +487,7 @@ left_col, right_col = st.columns([0.33, 0.67], gap="large")
 
 with left_col:
     lang = st.selectbox(t("en", "language"), options=["en", "es", "pt"], format_func=lambda value: LANG_NAMES[value])
+    st.session_state.lang = lang
     _render_branding(lang)
 
     st.markdown('<div class="goai-card">', unsafe_allow_html=True)
@@ -449,7 +501,7 @@ with left_col:
     uploaded_files = st.file_uploader(t(lang, "upload_files"), type=SUPPORTED_TYPES, accept_multiple_files=True)
     raw_text = st.text_area(t(lang, "paste_text"), height=120)
     if st.button(t(lang, "analyze"), type="primary", use_container_width=True):
-        _analyze_docs(lang, api_key, uploaded_files, raw_text)
+        _run_analysis_with_progress(lang, api_key, uploaded_files, raw_text)
         analysis = st.session_state.analysis
         apis = analysis.document_analysis.apis
     st.markdown('</div>', unsafe_allow_html=True)
