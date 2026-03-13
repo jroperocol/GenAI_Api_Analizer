@@ -32,9 +32,7 @@ def execute_test_request(
 
     if body:
         content_type = headers.get("Content-Type", "")
-        if "application/json" in content_type:
-            request_kwargs["data"] = body
-        elif "application/x-www-form-urlencoded" in content_type:
+        if "application/x-www-form-urlencoded" in content_type:
             request_kwargs["data"] = params
         else:
             request_kwargs["data"] = body
@@ -45,10 +43,12 @@ def execute_test_request(
     except requests.RequestException as exc:
         raise RequestExecutionError(str(exc)) from exc
     elapsed_ms = int((time.perf_counter() - started) * 1000)
+    response_text = resp.text
 
     return {
         "status_code": resp.status_code,
         "response_time_ms": elapsed_ms,
+        "response_size_bytes": len(response_text.encode("utf-8")),
         "headers": dict(resp.headers),
-        "body": resp.text,
+        "body": response_text,
     }

@@ -51,7 +51,7 @@ def extract_apis_with_openai(api_key: str, doc_text: str, model: str = "gpt-4.1-
     try:
         response = client.responses.create(
             model=model,
-            input=[{"role": "user", "content": [{"type": "input_text", "text": prompt}]}],
+            input=[{"role": "user", "content": [{"type": "text", "text": prompt}]}],
             temperature=0,
         )
     except Exception as exc:  # noqa: BLE001
