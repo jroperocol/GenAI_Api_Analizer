@@ -2,11 +2,12 @@
 
 from __future__ import annotations
 
+import base64
 import io
 import json
 import time
 import zipfile
-from typing import Dict, List
+from typing import Dict, List, Optional, Tuple
 
 import pandas as pd
 import streamlit as st
@@ -96,6 +97,74 @@ def _param_editor(api_id: str, key: str, data: List[ParamField]) -> List[ParamFi
 
 
 
+
+
+def _find_header(api: ApiRecord, header_name: str) -> Optional[ParamField]:
+    for header in api.headers:
+        if (header.name or "").lower() == header_name.lower():
+            return header
+    return None
+
+
+def _upsert_header(api: ApiRecord, name: str, value: str, sensitive: bool = False) -> None:
+    existing = _find_header(api, name)
+    if existing:
+        existing.value = value
+        existing.sensitive = sensitive or existing.sensitive
+    else:
+        api.headers.append(
+            ParamField(name=name, value=value, required=True, sensitive=sensitive, variable_name=name.lower().replace("-", "_"))
+        )
+
+
+def _extract_basic_from_headers(api: ApiRecord) -> Tuple[str, str]:
+    auth = _find_header(api, "Authorization")
+    if not auth or not auth.value:
+        return "", ""
+    val = str(auth.value).strip()
+    if not val.lower().startswith("basic "):
+        return "", ""
+    token = val.split(" ", 1)[1].strip()
+    try:
+        decoded = base64.b64decode(token).decode("utf-8")
+        if ":" in decoded:
+            user, pwd = decoded.split(":", 1)
+            return user, pwd
+    except Exception:
+        return "", ""
+    return "", ""
+
+
+def _extract_token_from_headers(api: ApiRecord) -> Tuple[str, str, str]:
+    auth = _find_header(api, "Authorization")
+    if auth and auth.value:
+        text = str(auth.value).strip()
+        if " " in text:
+            prefix, token = text.split(" ", 1)
+            return "Authorization", prefix, token
+        return "Authorization", "", text
+
+    for header in api.headers:
+        if header.name and header.value and _is_sensitive_param(header):
+            return header.name, "", str(header.value)
+    return "Authorization", "Bearer", ""
+
+
+def _sync_auth_to_headers(api: ApiRecord, auth_type: AuthType, fields: Dict[str, str]) -> None:
+    if auth_type == AuthType.BASIC:
+        user = fields.get("username", "").strip()
+        password = fields.get("password", "")
+        if user or password:
+            token = base64.b64encode(f"{user}:{password}".encode("utf-8")).decode("utf-8")
+            _upsert_header(api, "Authorization", f"Basic {token}", sensitive=True)
+    elif auth_type == AuthType.TOKEN:
+        header_name = fields.get("header_name", "Authorization").strip() or "Authorization"
+        prefix = fields.get("prefix", "").strip()
+        token_value = fields.get("token", "").strip()
+        if token_value:
+            value = f"{prefix} {token_value}".strip() if prefix else token_value
+            _upsert_header(api, header_name, value, sensitive=True)
+
 def _progress_update(progress_bar, status_box, start: int, target: int, msg: str) -> int:
     for p in range(start, target + 1):
         progress_bar.progress(p)
@@ -156,7 +225,7 @@ def _missing_critical_fields(api: ApiRecord) -> str:
         missing.append("method")
     if not full_url:
         missing.append("url")
-    if api.auth.type is None:
+    if api.auth.type is None or api.auth.type == AuthType.UNKNOWN:
         missing.append("auth")
 
     if api.body.required and (api.body.example in (None, "", {}, []) and not api.body.schema):
@@ -343,6 +412,24 @@ def _render_request_tab(lang: str, api: ApiRecord) -> None:
         api.auth.type = AuthType(st.selectbox(t(lang, "auth_type"), auth_values, index=auth_values.index(api.auth.type.value), key=f"auth_{api.id}"))
         api.auth.notes = st.text_input(t(lang, "auth_notes"), value=api.auth.notes, key=f"auth_notes_{api.id}")
 
+        if api.auth.type == AuthType.BASIC:
+            default_user, default_pass = _extract_basic_from_headers(api)
+            c_user, c_pass = st.columns(2)
+            basic_user = c_user.text_input(t(lang, "auth_username"), value=default_user, key=f"basic_user_{api.id}")
+            basic_pass = c_pass.text_input(t(lang, "auth_password"), value=default_pass, type="password", key=f"basic_pass_{api.id}")
+            _sync_auth_to_headers(api, api.auth.type, {"username": basic_user, "password": basic_pass})
+
+        elif api.auth.type == AuthType.TOKEN:
+            default_header, default_prefix, default_token = _extract_token_from_headers(api)
+            c_h, c_p, c_t = st.columns([1.3, 1, 2])
+            header_name = c_h.text_input(t(lang, "auth_header_name"), value=default_header, key=f"token_header_{api.id}")
+            token_prefix = c_p.text_input(t(lang, "auth_token_prefix"), value=default_prefix or "Bearer", key=f"token_prefix_{api.id}")
+            token_value = c_t.text_input(t(lang, "auth_token_value"), value=default_token, type="password", key=f"token_value_{api.id}")
+            _sync_auth_to_headers(api, api.auth.type, {"header_name": header_name, "prefix": token_prefix, "token": token_value})
+
+        elif api.auth.type == AuthType.UNKNOWN:
+            st.warning(t(lang, "auth_unknown_warning"))
+
     with tab_params:
         st.caption(t(lang, "path_params"))
         api.path_params = _param_editor(api.id, "path_params", api.path_params)
@@ -350,6 +437,7 @@ def _render_request_tab(lang: str, api: ApiRecord) -> None:
         api.query_params = _param_editor(api.id, "query_params", api.query_params)
 
     with tab_headers:
+        st.caption(t(lang, "headers_source_of_truth"))
         api.headers = _param_editor(api.id, "headers", api.headers)
 
     with tab_body:
