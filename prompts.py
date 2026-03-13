@@ -3,8 +3,15 @@
 from __future__ import annotations
 
 
-def build_extraction_prompt(doc_text: str) -> str:
+def build_extraction_prompt(doc_text: str, allow_sensitive: bool = False) -> str:
     """Create constrained prompt for JSON extraction."""
+    sensitive_rule = (
+        "Sensitive extraction is ENABLED: if credentials/tokens/keys are explicitly present in the documentation, "
+        "preserve them exactly in relevant auth/header/body fields."
+        if allow_sensitive
+        else "Sensitive extraction is DISABLED: do NOT output real secrets. Replace credential values with null, blank, or <REDACTED>."
+    )
+
     return f"""
 You are an API documentation extraction engine.
 Return ONLY valid JSON with no markdown fences and no explanatory text.
@@ -48,6 +55,7 @@ Rules:
 - Detect body content type.
 - Map path/query/header/body parameters.
 - Status should initially be needs_review unless clearly blocked/unsupported.
+- {sensitive_rule}
 
 Documentation text:
 {doc_text}

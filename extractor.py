@@ -39,7 +39,12 @@ def _load_json_from_response(raw_text: str) -> Dict[str, Any]:
         raise
 
 
-def extract_apis_with_openai(api_key: str, doc_text: str, model: str = "gpt-4.1-mini") -> AnalysisPayload:
+def extract_apis_with_openai(
+    api_key: str,
+    doc_text: str,
+    model: str = "gpt-4.1-mini",
+    allow_sensitive: bool = False,
+) -> AnalysisPayload:
     """Run extraction and return validated payload."""
     if not api_key:
         raise ExtractionError("OpenAI API key is required.")
@@ -47,7 +52,7 @@ def extract_apis_with_openai(api_key: str, doc_text: str, model: str = "gpt-4.1-
         raise ExtractionError("No documentation text to analyze.")
 
     client = OpenAI(api_key=api_key)
-    prompt = build_extraction_prompt(doc_text)
+    prompt = build_extraction_prompt(doc_text, allow_sensitive=allow_sensitive)
     try:
         response = client.responses.create(
             model=model,

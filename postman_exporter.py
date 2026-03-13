@@ -8,8 +8,7 @@ from typing import Dict, List, Optional, Set, Tuple
 from urllib.parse import urlparse
 
 from models import ApiRecord
-
-SENSITIVE_KEYS = {"authorization", "token", "password", "api_key", "x-api-key", "secret", "username"}
+from security import is_sensitive_key
 
 
 def _postman_url(raw_url: str) -> Dict:
@@ -28,6 +27,7 @@ def _postman_url(raw_url: str) -> Dict:
 def build_postman_collection_and_env(
     apis: List[ApiRecord],
     include_current_values: bool = False,
+    include_sensitive_values: bool = False,
     session_values: Optional[Dict[str, str]] = None,
 ) -> Tuple[str, str]:
     used_env_keys: Set[str] = {"base_url"}
@@ -39,20 +39,26 @@ def build_postman_collection_and_env(
         final_path = api.endpoint.path or api.endpoint.raw
         raw_url = f"{base_url.rstrip('/')}/{final_path.lstrip('/')}" if final_path else base_url
         header_entries = []
+
         for header in api.headers:
-            value = header.value or ""
-            if header.variable_name:
-                used_env_keys.add(header.variable_name)
-                value = f"{{{{{header.variable_name}}}}}"
-            header_entries.append({"key": header.name, "value": value, "type": "text"})
+            var_name = header.variable_name or header.name.lower().replace("-", "_")
+            used_env_keys.add(var_name)
+
+            is_sensitive = header.sensitive or is_sensitive_key(header.name) or is_sensitive_key(var_name)
+            if is_sensitive and not include_sensitive_values:
+                session_values.setdefault(var_name, "<REPLACE_ME>")
+            elif header.value:
+                session_values[var_name] = header.value
+
+            header_entries.append({"key": header.name, "value": f"{{{{{var_name}}}}}", "type": "text"})
 
         query_entries = []
         for query in api.query_params:
-            q_val = query.value or ""
-            if query.variable_name:
-                used_env_keys.add(query.variable_name)
-                q_val = f"{{{{{query.variable_name}}}}}"
-            query_entries.append({"key": query.name, "value": q_val, "disabled": not query.required})
+            var_name = query.variable_name or query.name.lower()
+            used_env_keys.add(var_name)
+            if query.value:
+                session_values[var_name] = query.value
+            query_entries.append({"key": query.name, "value": f"{{{{{var_name}}}}}", "disabled": not query.required})
 
         request_name = f"{(api.method.value if api.method else 'GET')} - {api.name or api.id}"
         request_obj = {
@@ -85,9 +91,13 @@ def build_postman_collection_and_env(
 
     env_values = []
     for key in sorted(used_env_keys):
+        sensitive = is_sensitive_key(key)
         value = "<REPLACE_ME>"
         if include_current_values and key in session_values:
-            value = session_values[key]
+            if sensitive and not include_sensitive_values:
+                value = "<REPLACE_ME>"
+            else:
+                value = session_values[key]
         env_values.append({"key": key, "value": value, "enabled": True})
 
     environment = {
