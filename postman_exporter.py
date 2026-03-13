@@ -45,11 +45,12 @@ def _header_var_name(name: str, existing: Optional[str]) -> str:
     return name.lower().replace("-", "_").strip()
 
 
-def _apply_path_param_variables(path_or_url: str, path_values: Dict[str, str]) -> str:
+def _apply_path_param_variables(path_or_url: str, path_values: Dict[str, str], use_literals: bool) -> str:
     rendered = path_or_url
-    for key in path_values:
-        rendered = rendered.replace(f"{{{key}}}", f"{{{{{key}}}}}")
-        rendered = rendered.replace(f":{key}", f"{{{{{key}}}}}")
+    for key, value in path_values.items():
+        replacement = value if use_literals and value else f"{{{{{key}}}}}"
+        rendered = rendered.replace(f"{{{key}}}", replacement)
+        rendered = rendered.replace(f":{key}", replacement)
     return rendered
 
 
@@ -77,7 +78,8 @@ def build_postman_collection_and_env(
             if p.value is not None:
                 session_values[p.name] = p.value
 
-        variable_path = _apply_path_param_variables(raw_target, path_param_values)
+        literal_mode = include_current_values and include_sensitive_values
+        variable_path = _apply_path_param_variables(raw_target, path_param_values, use_literals=literal_mode)
         raw_url = f"{base_url.rstrip('/')}/{variable_path.lstrip('/')}" if variable_path else base_url
 
         header_entries = []
@@ -90,18 +92,25 @@ def build_postman_collection_and_env(
             used_env_keys.add(var_name)
 
             sensitive = header.sensitive or is_sensitive_key(header.name) or is_sensitive_key(var_name)
-            if header.value is not None and (include_sensitive_values or not sensitive):
-                session_values[var_name] = header.value
+            header_value = ""
+            if header.value is not None:
+                header_value = str(header.value)
+
+            if header_value and (include_sensitive_values or not sensitive):
+                session_values[var_name] = header_value
             elif sensitive and not include_sensitive_values:
                 session_values.setdefault(var_name, "<REPLACE_ME>")
 
-            header_entries.append({"key": header.name, "value": f"{{{{{var_name}}}}}", "type": "text"})
+            use_literal = include_current_values and header_value and (include_sensitive_values or not sensitive)
+            resolved = header_value if use_literal else f"{{{{{var_name}}}}}"
+            header_entries.append({"key": header.name, "value": resolved, "type": "text"})
 
         # Ensure content-type can be exported even if not listed as a header row.
         if api.body.content_type and not any(h.get("key", "").lower() == "content-type" for h in header_entries):
             used_env_keys.add("content_type")
             session_values.setdefault("content_type", api.body.content_type)
-            header_entries.append({"key": "Content-Type", "value": "{{content_type}}", "type": "text"})
+            ct_value = api.body.content_type if (include_current_values and include_sensitive_values and api.body.content_type) else "{{content_type}}"
+            header_entries.append({"key": "Content-Type", "value": ct_value, "type": "text"})
 
         query_entries = []
         for query in api.query_params:
@@ -111,9 +120,11 @@ def build_postman_collection_and_env(
             if not var_name:
                 continue
             used_env_keys.add(var_name)
+            q_value = "" if query.value is None else str(query.value)
             if query.value is not None:
-                session_values[var_name] = query.value
-            query_entries.append({"key": query.name, "value": f"{{{{{var_name}}}}}", "disabled": not query.required})
+                session_values[var_name] = q_value
+            use_literal = include_current_values and q_value != ""
+            query_entries.append({"key": query.name, "value": q_value if use_literal else f"{{{{{var_name}}}}}", "disabled": not query.required})
 
         request_obj = {
             "name": f"{(api.method.value if api.method else 'GET')} - {api.name or api.id}",

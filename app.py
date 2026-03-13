@@ -238,6 +238,31 @@ def _headers_mirror_dataframe(api: ApiRecord, effective_headers: Dict[str, str])
             }
         )
     return pd.DataFrame(rows)
+
+
+def _auth_payload_from_state(api: ApiRecord) -> Dict[str, str]:
+    """Read current auth field values from session widgets, falling back to header-derived defaults."""
+    payload: Dict[str, str] = {}
+    if api.auth.type == AuthType.BASIC:
+        default_user, default_pass = _extract_basic_from_headers(api)
+        payload["username"] = str(st.session_state.get(f"basic_user_{api.id}", default_user))
+        payload["password"] = str(st.session_state.get(f"basic_pass_{api.id}", default_pass))
+    elif api.auth.type == AuthType.TOKEN:
+        default_header, default_prefix, default_token = _extract_token_from_headers(api)
+        payload["header_name"] = str(st.session_state.get(f"token_header_{api.id}", default_header or "Authorization"))
+        payload["prefix"] = str(st.session_state.get(f"token_prefix_{api.id}", default_prefix or "Bearer"))
+        payload["token"] = str(st.session_state.get(f"token_value_{api.id}", default_token))
+    return payload
+
+
+def _refresh_effective_headers(api: ApiRecord) -> Dict[str, str]:
+    """Synchronize auth-derived headers into api.headers and return current effective headers."""
+    payload = _auth_payload_from_state(api)
+    if payload:
+        _sync_auth_to_headers(api, api.auth.type, payload)
+    effective = _build_effective_headers(api, payload)
+    _sync_headers_table_from_effective_headers(api, effective)
+    return effective
 def _progress_update(progress_bar, status_box, start: int, target: int, msg: str) -> int:
     for p in range(start, target + 1):
         progress_bar.progress(p)
@@ -465,7 +490,6 @@ def _collect_session_values(apis: List[ApiRecord], include_sensitive: bool) -> D
 
 def _render_request_tab(lang: str, api: ApiRecord) -> None:
     methods = [m.value for m in HttpMethod]
-    auth_payload: Dict[str, str] = {}
     c1, c2, c3, c4 = st.columns([1, 3.2, 1, 1.3])
 
     method = c1.selectbox(t(lang, "http_method"), methods, index=methods.index(api.method.value if api.method else "GET"), key=f"method_{api.id}")
@@ -480,8 +504,6 @@ def _render_request_tab(lang: str, api: ApiRecord) -> None:
     api.description = st.text_area(t(lang, "description"), value=api.description, key=f"desc_{api.id}", height=70)
 
     tab_auth, tab_params, tab_headers, tab_body = st.tabs([t(lang, "auth_tab"), t(lang, "params_tab"), t(lang, "headers_tab"), t(lang, "body_tab")])
-    apply_auth = False
-
     with tab_auth:
         auth_values = [a.value for a in AuthType]
         api.auth.type = AuthType(st.selectbox(t(lang, "auth_type"), auth_values, index=auth_values.index(api.auth.type.value), key=f"auth_{api.id}"))
@@ -507,7 +529,6 @@ def _render_request_tab(lang: str, api: ApiRecord) -> None:
         elif api.auth.type == AuthType.UNKNOWN:
             st.warning(t(lang, "auth_unknown_warning"))
 
-        apply_auth = st.button(t(lang, "apply_auth_to_headers"), key=f"apply_auth_{api.id}")
 
     with tab_params:
         st.caption(t(lang, "path_params"))
@@ -539,8 +560,7 @@ def _render_request_tab(lang: str, api: ApiRecord) -> None:
     else:
         api.body.example = None
 
-    effective_headers = _build_effective_headers(api, auth_payload if apply_auth else {})
-    _sync_headers_table_from_effective_headers(api, effective_headers)
+    effective_headers = _refresh_effective_headers(api)
 
     with tab_headers:
         mirror_df = _headers_mirror_dataframe(api, effective_headers)
@@ -549,6 +569,7 @@ def _render_request_tab(lang: str, api: ApiRecord) -> None:
     validate_api(api)
 
     if run_now:
+        _refresh_effective_headers(api)
         _test_api(lang, api, method, final_url, body_text, timeout=30)
 
     live = st.session_state.last_response if st.session_state.last_response_api_id == api.id else None
@@ -578,6 +599,8 @@ def _render_export_tab(lang: str, apis: List[ApiRecord], selected_api: ApiRecord
         st.error(t(lang, "no_api_selected"))
         return
 
+    for export_api in selected_apis:
+        _refresh_effective_headers(export_api)
     session_values = _collect_session_values(selected_apis, include_sensitive=sensitive_mode)
     collection_json, environment_json = build_postman_collection_and_env(
         selected_apis,
@@ -651,6 +674,7 @@ with right_col:
         chosen = st.selectbox(t(lang, "api_selector"), list(labels.keys()), index=list(labels).index(current_label))
         st.session_state.selected_api_id = labels[chosen]
         selected = _get_selected_api(apis)
+        _refresh_effective_headers(selected)
 
         method = selected.method.value if selected.method else "-"
         color = METHOD_COLORS.get(method, "#94a3b8")
