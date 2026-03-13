@@ -24,6 +24,15 @@ def _postman_url(raw_url: str) -> Dict:
     }
 
 
+def _body_mode(content_type: str | None) -> str:
+    ct = (content_type or "").lower()
+    if "application/x-www-form-urlencoded" in ct:
+        return "urlencoded"
+    if "multipart/form-data" in ct:
+        return "formdata"
+    return "raw"
+
+
 def build_postman_collection_and_env(
     apis: List[ApiRecord],
     include_current_values: bool = False,
@@ -38,31 +47,38 @@ def build_postman_collection_and_env(
         base_url = api.endpoint.base_url or "{{base_url}}"
         final_path = api.endpoint.path or api.endpoint.raw
         raw_url = f"{base_url.rstrip('/')}/{final_path.lstrip('/')}" if final_path else base_url
-        header_entries = []
 
+        header_entries = []
         for header in api.headers:
-            var_name = header.variable_name or header.name.lower().replace("-", "_")
+            if not header.name:
+                continue
+            var_name = (header.variable_name or header.name.lower().replace("-", "_")).strip()
+            if not var_name:
+                continue
             used_env_keys.add(var_name)
 
-            is_sensitive = header.sensitive or is_sensitive_key(header.name) or is_sensitive_key(var_name)
-            if is_sensitive and not include_sensitive_values:
-                session_values.setdefault(var_name, "<REPLACE_ME>")
-            elif header.value:
+            sensitive = header.sensitive or is_sensitive_key(header.name) or is_sensitive_key(var_name)
+            if header.value is not None and (include_sensitive_values or not sensitive):
                 session_values[var_name] = header.value
+            elif sensitive and not include_sensitive_values:
+                session_values.setdefault(var_name, "<REPLACE_ME>")
 
             header_entries.append({"key": header.name, "value": f"{{{{{var_name}}}}}", "type": "text"})
 
         query_entries = []
         for query in api.query_params:
-            var_name = query.variable_name or query.name.lower()
+            if not query.name:
+                continue
+            var_name = (query.variable_name or query.name.lower()).strip()
+            if not var_name:
+                continue
             used_env_keys.add(var_name)
-            if query.value:
+            if query.value is not None:
                 session_values[var_name] = query.value
             query_entries.append({"key": query.name, "value": f"{{{{{var_name}}}}}", "disabled": not query.required})
 
-        request_name = f"{(api.method.value if api.method else 'GET')} - {api.name or api.id}"
         request_obj = {
-            "name": request_name,
+            "name": f"{(api.method.value if api.method else 'GET')} - {api.name or api.id}",
             "request": {
                 "method": api.method.value if api.method else "GET",
                 "header": header_entries,
@@ -70,13 +86,24 @@ def build_postman_collection_and_env(
             },
             "response": [],
         }
-
         if query_entries:
             request_obj["request"]["url"]["query"] = query_entries
 
         if api.body.example is not None:
-            raw_body = api.body.example if isinstance(api.body.example, str) else json.dumps(api.body.example, indent=2)
-            request_obj["request"]["body"] = {"mode": "raw", "raw": raw_body}
+            mode = _body_mode(api.body.content_type)
+            if mode == "urlencoded" and isinstance(api.body.example, dict):
+                request_obj["request"]["body"] = {
+                    "mode": "urlencoded",
+                    "urlencoded": [{"key": k, "value": str(v), "type": "text"} for k, v in api.body.example.items()],
+                }
+            elif mode == "formdata" and isinstance(api.body.example, dict):
+                request_obj["request"]["body"] = {
+                    "mode": "formdata",
+                    "formdata": [{"key": k, "value": str(v), "type": "text"} for k, v in api.body.example.items()],
+                }
+            else:
+                raw_body = api.body.example if isinstance(api.body.example, str) else json.dumps(api.body.example, indent=2)
+                request_obj["request"]["body"] = {"mode": "raw", "raw": raw_body}
 
         items.append(request_obj)
 
@@ -94,10 +121,7 @@ def build_postman_collection_and_env(
         sensitive = is_sensitive_key(key)
         value = "<REPLACE_ME>"
         if include_current_values and key in session_values:
-            if sensitive and not include_sensitive_values:
-                value = "<REPLACE_ME>"
-            else:
-                value = session_values[key]
+            value = session_values[key] if (include_sensitive_values or not sensitive) else "<REPLACE_ME>"
         env_values.append({"key": key, "value": value, "enabled": True})
 
     environment = {
@@ -108,5 +132,4 @@ def build_postman_collection_and_env(
         "_postman_exported_at": "",
         "_postman_exported_using": "GoAI API Documentation Interpreter",
     }
-
     return json.dumps(collection, indent=2), json.dumps(environment, indent=2)
